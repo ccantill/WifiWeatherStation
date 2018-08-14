@@ -14,3 +14,6 @@ const uint8_t status_wifi_poor_bits[] PROGMEM = {
 
 const uint8_t status_wifi_connecting_bits[] PROGMEM = {
   0x3E, 0x2A, 0x14, 0x08, 0x14, 0x22, 0x3E, };
+
+const uint8_t status_wifi_deepsleep_bits[] PROGMEM = {
+  0x3E, 0x20, 0x10, 0x08, 0x04, 0x02, 0x3E, };

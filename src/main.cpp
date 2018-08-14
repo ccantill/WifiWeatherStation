@@ -34,23 +34,11 @@
 #include <WiFiManager.h>
 #include <EEPROM.h>
 #include <ESP8266WebServer.h>
-
-const int MAGIC_NUMBER = 0x4a414bc1;
-
-struct settings {
-  int magicNumber;
-  bool deepSleepMode;
-  bool influxEnabled;
-  char influxHostName[20];
-  unsigned short influxPort;
-  char influxDatabase[20];
-  char influxSeries[20];
-  char influxTags[30];
-};
+#include "settings.h"
 
 // Include the correct display library
 // For a connection via I2C using Wire include
-#include <Wire.h>  // Only needed for Arduino 1.6.5 and earlier
+#include <Wire.h>    // Only needed for Arduino 1.6.5 and earlier
 #include <SSD1306.h> // alias for `#include "SSD1306Wire.h"`
 // or #include "SH1106.h" alis for `#include "SH1106Wire.h"`
 // For a connection via I2C using brzo_i2c (must be installed) include
@@ -70,30 +58,34 @@ struct settings {
 // SH1106Brzo  display(0x3c, D3, D5);
 
 // Initialize the OLED display using Wire library
-SSD1306  display(0x3c, D2, D1);
+SSD1306 display(0x3c, D2, D1);
 ESP8266WebServer httpServer(80);
+
+const int WAKE_UP_PIN = 14;
 
 int screenW = 128;
 int screenH = 64;
 
 float temperature_C = 22.2;
 float humidity_pct = 80;
-String ip = "192.168.1.52";
-boolean connected = true;
+
+bool inLowPowerMode = false;
 
 WiFiManager wifiManager;
 
-void displaySetUpWifi(WiFiManager *wifiManager) {
+void displaySetUpWifi(WiFiManager *wifiManager)
+{
   display.clear();
   display.setFont(ArialMT_Plain_16);
   display.setTextAlignment(TEXT_ALIGN_CENTER);
-  display.drawString(64,0, "Connect to:");
-  display.drawString(64,32, wifiManager->getConfigPortalSSID());
+  display.drawString(64, 0, "Connect to:");
+  display.drawString(64, 32, wifiManager->getConfigPortalSSID());
 
   display.display();
 }
 
-void updateDisplay() {
+void updateDisplay()
+{
   String temperature = String(temperature_C, 1) + "°";
   String humidity = String(humidity_pct, 0) + "%";
   display.clear();
@@ -105,51 +97,99 @@ void updateDisplay() {
 
   display.setFont(Dialog_plain_10);
   display.setTextAlignment(TEXT_ALIGN_LEFT);
-  if(WiFi.isConnected()) {
+  if (inLowPowerMode)
+  {
+    display.drawString(0, 0, "Press btn to connect");
+    display.drawXbm(120, 4, status_width, status_height, status_wifi_deepsleep_bits);
+  }
+  else if (WiFi.isConnected())
+  {
     display.drawString(0, 0, WiFi.localIP().toString());
-    display.drawXbm(120, 2, status_width, status_height, status_wifi_full_bits);
-  } else {
+    display.drawXbm(120, 4, status_width, status_height, status_wifi_full_bits);
+  }
+  else
+  {
     display.drawString(0, 0, "Not connected");
   }
 
   display.display();
 }
 
-void initEeprom() {
-  int magicNumber;
-  EEPROM.get(offsetof(settings, magicNumber), magicNumber);
-  if(magicNumber != MAGIC_NUMBER) {
-    settings newSettings;
-    newSettings.deepSleepMode = false;
-    newSettings.influxEnabled = false;
-    EEPROM.put(0, newSettings);
-  }
+void enterDeepSleep()
+{
+  Serial.println("Sleeping for " + String(settings.deepSleepTimer) + " seconds");
+  ESP.deepSleep(1e6 * settings.deepSleepTimer);
 }
 
-void http_root() {
+void http_root()
+{
   httpServer.send(200, "text/html", "<html><head><title>WiFiWeatherStation Setup</title></head><body><a href='/resetWifi'>Reset WiFi settings</a></body></html>");
 }
 
-void http_resetWifi() {
+void http_resetWifi()
+{
   httpServer.send(200, "text/plain", "OK. Restarting the sensor.");
   wifiManager.resetSettings();
   ESP.restart();
 }
 
-void setup() {
+void http_lowPower()
+{
+  Serial.println("Entering low power mode");
+  httpServer.send(200, "text/plain", "OK. Entering low power mode");
+  inLowPowerMode = true;
+  saveSettings();
+  updateDisplay();
+  enterDeepSleep();
+}
+
+void sendUpdate()
+{
+  Serial.println("Pretending to send updates");
+}
+
+void setup()
+{
   Serial.begin(115200);
-  initEeprom();
-  bool deepSleep;
-  EEPROM.get(offsetof(settings, deepSleepMode), deepSleep);
-  if(deepSleep) {
-    Serial.println("Deep sleep not yet implemented");
-    // not yet implemented
-  } else {
+  loadSettings();
+
+  pinMode(WAKE_UP_PIN, INPUT);
+  
+  rst_info* resetInfo = ESP.getResetInfoPtr();
+  Serial.println("Reset reason " + String(resetInfo->reason, 16));
+
+  int wakeUp = digitalRead(WAKE_UP_PIN);
+
+  if ((resetInfo->reason == REASON_DEEP_SLEEP_AWAKE) && !wakeUp)
+  {
+    Serial.println("Waking up from deep sleep!");
+    inLowPowerMode = true;
+    // since we have no readings we're assuming they're always the same anyway
+    bool changed = false;
+    if (changed)
+    {
+      display.resume();
+      updateDisplay();
+      wifiManager.autoConnect();
+      updateDisplay();
+
+      sendUpdate();
+    }
+    enterDeepSleep();
+  }
+  else
+  {
+    inLowPowerMode = false;
     Serial.println("Initing display");
-    display.init();
-    display.flipScreenVertically();
-    display.setContrast(255);
-    display.clear();
+
+    if(resetInfo->reason == REASON_DEEP_SLEEP_AWAKE) {
+      // when waking up from deep sleep, assume display still has its settings so don't init display, just init the library
+      display.resume();
+    } else {
+      display.init();
+      display.flipScreenVertically();
+      display.setContrast(255);
+    }
 
     // setup callback for displaying setup instructions
     wifiManager.setAPCallback(displaySetUpWifi);
@@ -162,12 +202,14 @@ void setup() {
     // setup http endpoints
     httpServer.on("/", http_root);
     httpServer.on("/resetWifi", http_resetWifi);
+    httpServer.on("/lowPower", http_lowPower);
     httpServer.begin();
 
     updateDisplay();
   }
 }
 
-void loop() {
+void loop()
+{
   httpServer.handleClient();
 }
