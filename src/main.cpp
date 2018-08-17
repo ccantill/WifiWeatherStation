@@ -35,6 +35,10 @@
 #include <EEPROM.h>
 #include <ESP8266WebServer.h>
 #include "settings.h"
+#include <ClosedCube_SHT31D.h>
+#include <Ticker.h>
+
+#include "influx.h"
 
 // Include the correct display library
 // For a connection via I2C using Wire include
@@ -63,15 +67,57 @@ ESP8266WebServer httpServer(80);
 
 const int WAKE_UP_PIN = 14;
 
+const float temperature_threshold = 0.2;
+const float humidity_threshold = 1;
+
 int screenW = 128;
 int screenH = 64;
 
-float temperature_C = 22.2;
-float humidity_pct = 80;
-
 bool inLowPowerMode = false;
+bool syncNeeded = false;
+
+struct STATE {
+  float temperature_C;
+  float humidity_pct;
+};
+
+STATE state = {
+  NAN, NAN
+};
 
 WiFiManager wifiManager;
+ClosedCube_SHT31D sht3xd;
+Ticker ticker;
+
+String SHT3XD_Error_to_String(SHT31D_ErrorCode err)
+{
+  switch (err)
+  {
+  case SHT3XD_NO_ERROR:
+    return "SHT3XD_NO_ERROR";
+  case SHT3XD_CRC_ERROR:
+    return "SHT3XD_CRC_ERROR ";
+  case SHT3XD_TIMEOUT_ERROR:
+    return "SHT3XD_TIMEOUT_ERROR ";
+  case SHT3XD_PARAM_WRONG_MODE:
+    return "SHT3XD_PARAM_WRONG_MODE ";
+  case SHT3XD_PARAM_WRONG_REPEATABILITY:
+    return "SHT3XD_PARAM_WRONG_REPEATABILITY ";
+  case SHT3XD_PARAM_WRONG_FREQUENCY:
+    return "SHT3XD_PARAM_WRONG_FREQUENCY ";
+  case SHT3XD_PARAM_WRONG_ALERT:
+    return "SHT3XD_PARAM_WRONG_ALERT ";
+  case SHT3XD_WIRE_I2C_DATA_TOO_LOG:
+    return "SHT3XD_WIRE_I2C_DATA_TOO_LOG ";
+  case SHT3XD_WIRE_I2C_RECEIVED_NACK_ON_ADDRESS:
+    return "SHT3XD_WIRE_I2C_RECEIVED_NACK_ON_ADDRESS ";
+  case SHT3XD_WIRE_I2C_RECEIVED_NACK_ON_DATA:
+    return "SHT3XD_WIRE_I2C_RECEIVED_NACK_ON_DATA ";
+  case SHT3XD_WIRE_I2C_UNKNOW_ERROR:
+    return "SHT3XD_WIRE_I2C_UNKNOW_ERROR ";
+  default: return "WTF?";
+  }
+}
 
 void displaySetUpWifi(WiFiManager *wifiManager)
 {
@@ -86,8 +132,8 @@ void displaySetUpWifi(WiFiManager *wifiManager)
 
 void updateDisplay()
 {
-  String temperature = String(temperature_C, 1) + "°";
-  String humidity = String(humidity_pct, 0) + "%";
+  String temperature = String(state.temperature_C, 1) + "°";
+  String humidity = String(state.humidity_pct, 0) + "%";
   display.clear();
   display.setFont(ArialMT_Plain_24);
   display.setTextAlignment(TEXT_ALIGN_LEFT);
@@ -117,6 +163,7 @@ void updateDisplay()
 
 void enterDeepSleep()
 {
+  ESP.rtcUserMemoryWrite(0, (uint32_t*) &state, sizeof(state));
   Serial.println("Sleeping for " + String(settings.deepSleepTimer) + " seconds");
   ESP.deepSleep(1e6 * settings.deepSleepTimer);
 }
@@ -124,13 +171,6 @@ void enterDeepSleep()
 void http_root()
 {
   httpServer.send(200, "text/html", "<html><head><title>WiFiWeatherStation Setup</title></head><body><a href='/resetWifi'>Reset WiFi settings</a></body></html>");
-}
-
-void http_resetWifi()
-{
-  httpServer.send(200, "text/plain", "OK. Restarting the sensor.");
-  wifiManager.resetSettings();
-  ESP.restart();
 }
 
 void http_lowPower()
@@ -143,29 +183,127 @@ void http_lowPower()
   enterDeepSleep();
 }
 
+void http_handleSettings() {
+    StaticJsonBuffer<512> jsonBuffer;
+    if(httpServer.method() == HTTP_GET) {
+        JsonObject& root = jsonBuffer.createObject(); 
+        JsonObject& influx = root.createNestedObject("influx");
+        influx["enabled"] = settings.influxEnabled;
+        influx["host"] = settings.influxHost;
+        influx["database"] = settings.influxDatabase;
+        influx["series"] = settings.influxSeries;
+        influx["tags"] = settings.influxTags;
+        
+        JsonObject& lowPower = root.createNestedObject("lowpower");
+        lowPower["updateInterval"] = settings.deepSleepTimer;
+
+        String json;
+        root.printTo(json);
+        httpServer.send(200, "text/json", json);
+    } else if(httpServer.method() == HTTP_POST) {
+        JsonObject& root = jsonBuffer.parseObject(httpServer.arg("plain"));
+        if(!root.success()) {
+          httpServer.send(400, "text/plain", "Body could not be parsed");
+        }
+        Serial.println(httpServer.arg("plain"));
+
+        int deepSleepTimer = root["lowpower"]["updateInterval"];
+        bool influxEnabled = root["influx"]["enabled"];
+        String influxDatabase = root["influx"]["database"];
+        String influxHost = root["influx"]["host"];
+        unsigned short influxPort = root["influx"]["port"];
+        String influxSeries = root["influx"]["series"];
+        String influxTags = root["influx"]["tags"];
+
+        // validation
+        if(influxEnabled && (
+            influxDatabase.length() == 0 ||
+            influxHost.length() == 0 ||
+            influxSeries.length() == 0 || 
+            influxPort == 0
+        )) {
+            httpServer.send(400, "text/plain", "Influx enabled but not enough details provided");
+            return;
+        }
+
+        settings.deepSleepTimer = deepSleepTimer;
+        settings.influxEnabled = influxEnabled;
+        influxDatabase.getBytes((unsigned char*) &settings.influxDatabase, sizeof settings.influxDatabase, 0);
+        influxPort = influxPort;
+        influxHost.getBytes((unsigned char*) &settings.influxHost, sizeof settings.influxHost, 0);
+        influxSeries.getBytes((unsigned char*) &settings.influxSeries, sizeof settings.influxSeries, 0);
+        influxTags.getBytes((unsigned char*) &settings.influxTags, sizeof settings.influxTags, 0);
+        saveSettings();
+
+        httpServer.send(200, "text/plain", "Settings saved");
+    } else {
+        httpServer.send(405, "text/plain", "Method not allowed");
+    }
+}
+
+void http_factoryReset() {
+  httpServer.send(200, "text/plain", "Resetting to factory settings and restarting");
+  resetSettings();
+  wifiManager.resetSettings();
+  ESP.restart();
+}
+
+bool readClimate() {
+  SHT31D data = sht3xd.periodicFetchData();
+  if(data.error != SHT3XD_NO_ERROR) {
+    Serial.println("[SHT3XD] Read error " + SHT3XD_Error_to_String(data.error));
+    return false;
+  }
+  Serial.println("read " + String(data.t) + " and " + String(data.rh));
+  if(isnan(state.temperature_C) || isnan(state.humidity_pct) || fabs(data.t - state.temperature_C) > temperature_threshold || fabs(data.rh - state.humidity_pct) > humidity_threshold) {
+    state.temperature_C = data.t;
+    state.humidity_pct = data.rh;
+    return true;
+  }
+  return false;
+}
+
 void sendUpdate()
 {
-  Serial.println("Pretending to send updates");
+  syncInflux(state.temperature_C, state.humidity_pct);
+}
+
+void updateClimate() {
+  if(readClimate()) {
+    syncNeeded = true;
+  }
 }
 
 void setup()
 {
+  Wire.begin();
   Serial.begin(115200);
   loadSettings();
-
   pinMode(WAKE_UP_PIN, INPUT);
   
   rst_info* resetInfo = ESP.getResetInfoPtr();
   Serial.println("Reset reason " + String(resetInfo->reason, 16));
 
+  if(sht3xd.begin(0x44)) {
+    Serial.println("SHT31 failed to initialize");
+  }
+
+  if (sht3xd.periodicStart(SHT3XD_REPEATABILITY_HIGH, SHT3XD_FREQUENCY_10HZ) != SHT3XD_NO_ERROR) {
+		Serial.println("[ERROR] Cannot start periodic mode");
+  }
+
   int wakeUp = digitalRead(WAKE_UP_PIN);
+
+  if((resetInfo->reason == REASON_DEEP_SLEEP_AWAKE)) {
+    ESP.rtcUserMemoryRead(0, (uint32_t*) &state, sizeof(state));
+  }
 
   if ((resetInfo->reason == REASON_DEEP_SLEEP_AWAKE) && !wakeUp)
   {
     Serial.println("Waking up from deep sleep!");
     inLowPowerMode = true;
     // since we have no readings we're assuming they're always the same anyway
-    bool changed = false;
+    bool changed = readClimate();
     if (changed)
     {
       display.resume();
@@ -191,6 +329,8 @@ void setup()
       display.setContrast(255);
     }
 
+    readClimate();
+
     // setup callback for displaying setup instructions
     wifiManager.setAPCallback(displaySetUpWifi);
 
@@ -199,17 +339,25 @@ void setup()
 
     wifiManager.autoConnect();
 
+    updateDisplay();
+
     // setup http endpoints
     httpServer.on("/", http_root);
-    httpServer.on("/resetWifi", http_resetWifi);
+    httpServer.on("/factoryReset", http_factoryReset);
     httpServer.on("/lowPower", http_lowPower);
+    httpServer.on("/settings", http_handleSettings);
     httpServer.begin();
 
-    updateDisplay();
+    ticker.attach(1, updateClimate);
   }
 }
 
 void loop()
 {
   httpServer.handleClient();
+  if(syncNeeded) {
+    syncNeeded = false;
+    updateDisplay();
+    sendUpdate();
+  }
 }
