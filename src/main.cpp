@@ -124,7 +124,7 @@ void displaySetUpWifi(WiFiManager *wifiManager)
   display.clear();
   display.setFont(ArialMT_Plain_16);
   display.setTextAlignment(TEXT_ALIGN_CENTER);
-  display.drawString(64, 0, "Connect to:");
+  display.drawString(64, 4, "Connect to:");
   display.drawString(64, 32, wifiManager->getConfigPortalSSID());
 
   display.display();
@@ -145,8 +145,7 @@ void updateDisplay()
   display.setTextAlignment(TEXT_ALIGN_LEFT);
   if (inLowPowerMode)
   {
-    display.drawString(0, 0, "Press btn to connect");
-    display.drawXbm(120, 4, status_width, status_height, status_wifi_deepsleep_bits);
+    display.drawString(0, 0, "Press button to connect");
   }
   else if (WiFi.isConnected())
   {
@@ -177,8 +176,8 @@ void http_lowPower()
 {
   Serial.println("Entering low power mode");
   httpServer.send(200, "text/plain", "OK. Entering low power mode");
+  display.setContrast(settings.lowPowerContrast);
   inLowPowerMode = true;
-  saveSettings();
   updateDisplay();
   enterDeepSleep();
 }
@@ -190,12 +189,17 @@ void http_handleSettings() {
         JsonObject& influx = root.createNestedObject("influx");
         influx["enabled"] = settings.influxEnabled;
         influx["host"] = settings.influxHost;
+        influx["port"] = settings.influxPort;
         influx["database"] = settings.influxDatabase;
         influx["series"] = settings.influxSeries;
         influx["tags"] = settings.influxTags;
         
         JsonObject& lowPower = root.createNestedObject("lowpower");
         lowPower["updateInterval"] = settings.deepSleepTimer;
+        lowPower["contrast"] = settings.lowPowerContrast;
+
+        JsonObject& general = root.createNestedObject("general");
+        general["contrast"] = settings.displayContrast;
 
         String json;
         root.printTo(json);
@@ -214,6 +218,8 @@ void http_handleSettings() {
         unsigned short influxPort = root["influx"]["port"];
         String influxSeries = root["influx"]["series"];
         String influxTags = root["influx"]["tags"];
+        unsigned char contrast = root["general"]["contrast"];
+        unsigned char lowPowerContrast = root["lowpower"]["contrast"];
 
         // validation
         if(influxEnabled && (
@@ -233,7 +239,11 @@ void http_handleSettings() {
         influxHost.getBytes((unsigned char*) &settings.influxHost, sizeof settings.influxHost, 0);
         influxSeries.getBytes((unsigned char*) &settings.influxSeries, sizeof settings.influxSeries, 0);
         influxTags.getBytes((unsigned char*) &settings.influxTags, sizeof settings.influxTags, 0);
+        settings.displayContrast = contrast;
+        settings.lowPowerContrast = lowPowerContrast;
         saveSettings();
+
+        display.setContrast(settings.displayContrast);
 
         httpServer.send(200, "text/plain", "Settings saved");
     } else {
@@ -248,13 +258,17 @@ void http_factoryReset() {
   ESP.restart();
 }
 
+void http_influxLastResponse() {
+  httpServer.send(200, "text/plain", String(lastInfluxPostResult));
+}
+
 bool readClimate() {
   SHT31D data = sht3xd.periodicFetchData();
   if(data.error != SHT3XD_NO_ERROR) {
     Serial.println("[SHT3XD] Read error " + SHT3XD_Error_to_String(data.error));
     return false;
   }
-  Serial.println("read " + String(data.t) + " and " + String(data.rh));
+  Serial.println("read " + String(data.t) + " and " + String(data.rh) + ". Previous readings were " + String(state.humidity_pct) + " and " + String(state.temperature_C));
   if(isnan(state.temperature_C) || isnan(state.humidity_pct) || fabs(data.t - state.temperature_C) > temperature_threshold || fabs(data.rh - state.humidity_pct) > humidity_threshold) {
     state.temperature_C = data.t;
     state.humidity_pct = data.rh;
@@ -301,17 +315,20 @@ void setup()
   if ((resetInfo->reason == REASON_DEEP_SLEEP_AWAKE) && !wakeUp)
   {
     Serial.println("Waking up from deep sleep!");
-    inLowPowerMode = true;
     // since we have no readings we're assuming they're always the same anyway
     bool changed = readClimate();
     if (changed)
     {
+      inLowPowerMode = false;
       display.resume();
       updateDisplay();
       wifiManager.autoConnect();
       updateDisplay();
 
       sendUpdate();
+
+      inLowPowerMode = true;
+      updateDisplay();
     }
     enterDeepSleep();
   }
@@ -326,7 +343,7 @@ void setup()
     } else {
       display.init();
       display.flipScreenVertically();
-      display.setContrast(255);
+      display.setContrast(settings.displayContrast);
     }
 
     readClimate();
@@ -346,6 +363,7 @@ void setup()
     httpServer.on("/factoryReset", http_factoryReset);
     httpServer.on("/lowPower", http_lowPower);
     httpServer.on("/settings", http_handleSettings);
+    httpServer.on("/influx/lastResponse", http_influxLastResponse);
     httpServer.begin();
 
     ticker.attach(1, updateClimate);

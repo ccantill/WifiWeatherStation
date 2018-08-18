@@ -15,6 +15,8 @@ struct struct_settings
     char influxDatabase[20];
     char influxSeries[20];
     char influxTags[30];
+    char displayContrast;
+    char lowPowerContrast;
 };
 
 const int MAGIC_NUMBER = 0x1a512f59;
